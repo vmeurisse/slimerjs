@@ -70,3 +70,22 @@ describe("the loaded module requiredexample", function() {
         expect(ex.hasPhantomObject).toBeTruthy();
     });
 });
+
+
+describe("The module loader", function() {
+
+    it("can load Coffee-Script modules", function(){
+        var sample = require('cs/sample')
+        expect(sample.label).toEqual('sample module 1');
+        var sample2 = require('cs/sample2.coffee')
+        expect(sample2.label).toEqual('sample module 2');
+    });
+    it("can load Json modules", function(){
+        var sample = require('a/something.json')
+        //var sample = require('a/ddd.js')
+        expect(sample.foo).toEqual('bar');
+        expect(sample.hello).toEqual('world');
+    });
+
+
+});

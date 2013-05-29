@@ -12,9 +12,14 @@ const Ci = Components.interfaces;
 Cu.import("resource://gre/modules/Services.jsm");
 Cu.import('resource://slimerjs/addon-sdk/toolkit/loader.js'); //Sandbox, Require, main, Module, Loader
 Cu.import('resource://slimerjs/slConsole.jsm');
+Cu.import('resource://slimerjs/slUtils.jsm');
 
 var windowMediator = Cc["@mozilla.org/appshell/window-mediator;1"]
                      .getService(Ci.nsIWindowMediator);
+
+var fileHandler = Cc["@mozilla.org/network/protocol;1?name=file"]
+                     .getService(Ci.nsIFileProtocolHandler)
+
 var mainSandbox = null;
 var mainLoader = null;
 
@@ -75,7 +80,7 @@ var slLauncher = {
     }
 }
 
-function getFile(path) {
+function getFile(path, isDir) {
     let file = Cc['@mozilla.org/file/local;1']
               .createInstance(Ci.nsILocalFile);
     try {
@@ -87,11 +92,48 @@ function getFile(path) {
     if (!file.exists()) {
         throw Error("Modules path "+path+" does not exists");
     }
-    if (!file.isDirectory()) {
+    if (isDir && !file.isDirectory()) {
         throw Error("Modules path "+path+" is not a directory");
     }
     return file;
 }
+
+/**
+ * @param string filename
+ * @param base nsIFile
+ */
+function isFile(filename, base) {
+    try {
+        // see if we have an absolute path
+        let file;
+        if (base) {
+            file = base.clone();
+            file.appendRelativePath(filename);
+        }
+        else {
+            file = Cc['@mozilla.org/file/local;1']
+                        .createInstance(Ci.nsILocalFile);
+            file.initWithPath(filename);
+        }
+        if (file.exists()) {
+            return file.path;
+        }
+    }
+    catch(e){
+    }
+    return false;
+}
+
+const nativeModules = {
+    'fs' : 'sdk/io/file',
+    'webpage': 'slimer-sdk/webpage',
+    'net-log' : 'slimer-sdk/net-log',
+    'webserver' : 'webserver',
+    'system' : 'system',
+    'vm':'slimer-sdk/vm',
+    'path':'slimer-sdk/path',
+};
+
 
 /**
  * prepare the module loader
@@ -140,7 +182,7 @@ function prepareLoader(fileURI, dirFile) {
                     arr[idx] = path;
                     return;
                 }
-                let file = getFile(path);
+                let file = getFile(path, true);
                 pathsNsFile[idx] = file;
                 loader.mapping.push([file.path, Services.io.newFileURI(file).spec]);
                 arr[idx] = file.path;
@@ -160,9 +202,34 @@ function prepareLoader(fileURI, dirFile) {
         '@loader/': 'resource://slimerjs/@loader',
         'chrome': 'resource://slimerjs/@chrome',
         'webserver' : 'resource://slimerjs/webserver.jsm',
-        'system' : 'resource://slimerjs/system.jsm'
+        'system' : 'resource://slimerjs/system.jsm',
+        'coffee-script/':'resource://slimerjs/coffee-script/lib/coffee-script/',
     }
     pathsMapping[dirPath] = dirURI;
+
+    // list of extensions and their compiler
+    var extensions = {
+        '.js': function(module, filename) {
+            let content = readSyncStringFromFile(getFile(filename));
+            return module._compile(content, filename);
+        },
+        '.json': function(module, filename) {
+            let content = readSyncStringFromFile(getFile(filename));
+            module.exports = JSON.parse(content);
+        }
+    }
+
+    function findFileExtension(id, baseFile) {
+        let f = isFile(id, baseFile)
+        if (f)
+            return f;
+        for(let ext in extensions) {
+            f = isFile(id+ext, baseFile);
+            if (f)
+                return f;
+        }
+        return null;
+    }
 
     // will contain all global objects/function/variable accessible from all
     // modules.
@@ -185,9 +252,10 @@ function prepareLoader(fileURI, dirFile) {
         // this function should return the true id of the module.
         // The returned id should be an id or an absolute path of a file
         resolve: function(id, requirer) {
-            if (id == 'fs') {
-                return 'sdk/io/file';
-            }
+
+            if (id in nativeModules)
+                return nativeModules[id];
+
             if (id == 'chrome' || id.indexOf('@loader/') === 0) {
                 if (requirer.indexOf('sdk/') === 0
                     || requirer.indexOf('slimer-sdk/') === 0) {
@@ -201,17 +269,6 @@ function prepareLoader(fileURI, dirFile) {
                     throw Error("Unknown "+ id +" module");
             }
 
-            if (id == 'webpage') {
-                return 'slimer-sdk/webpage';
-            }
-
-            if (id == 'net-log') {
-                return 'slimer-sdk/net-log';
-            }
-
-            if (id == 'webserver' || id == 'system')
-                return id;
-
             // let's resolve other id module as usual
             id = Loader.resolve(id, requirer);
 
@@ -220,32 +277,20 @@ function prepareLoader(fileURI, dirFile) {
                 return id;
             }
 
-            let idjs = id.substr(-3) === '.js' ? id : id + '.js';
             // if requirer is an absolute path, the id is then an absolute path after Loader.resolve
-            try {
-                // see if we have an absolute path
-                let file = Cc['@mozilla.org/file/local;1']
-                            .createInstance(Ci.nsILocalFile);
-                file.initWithPath(idjs);
-                if (file.exists()) {
-                    return idjs;
-                }
-            }
-            catch(e){}
+            let realId = findFileExtension(id);
+            if (realId)
+                return realId;
 
             // this is not an absolute path, try to resolve the id
             // against all registered path
             for (let i=0; i < pathsNsFile.length;i++) {
-                let f = pathsNsFile[i];
-                if (!f)
+                let dir = pathsNsFile[i];
+                if (!dir)
                     continue;
-                f = f.clone();
-                try {
-                    f.appendRelativePath(idjs);
-                    if (f.exists())
-                        return f.path;
-                }
-                catch(e) {}
+                let file = findFileExtension(id, dir);
+                if (file)
+                    return file;
             }
             return id;
         },
@@ -262,6 +307,12 @@ function prepareLoader(fileURI, dirFile) {
                                   {
                                     enumerable:true,
                                     value: globalProperties,
+                                    writable:false,
+                                  });
+            Object.defineProperty(require, 'extensions',
+                                  {
+                                    enumerable:true,
+                                    value: extensions,
                                     writable:false,
                                   });
 
@@ -287,16 +338,54 @@ function prepareLoader(fileURI, dirFile) {
             });
             Object.defineProperties(sandbox, Loader.descriptor(proto));
 
-            Loader.load(loader, module, sandbox)
+            module._compile = function (content, filename) {
+                Loader.load(loader, module, sandbox, content);
+            }
+
+            if (module.uri.indexOf('file://') == -1) {
+                Loader.load(loader, module, sandbox);
+                return;
+            }
+            let file;
+            try {
+                file = fileHandler.getFileFromURLSpec(module.uri);
+            }
+            catch(e) {
+                dump("err for "+module.uri+" :"+e+"\n")
+                throw e;
+            }
+            let filename = file.leafName;
+            let source = '';
+            for(let ext in extensions) {
+                let idx = filename.lastIndexOf(ext);
+                if (idx == -1 || idx != (filename.length - ext.length)) {
+                    continue;
+                }
+                extensions[ext](module, file.path);
+            }
         }
     });
 
     return loader;
 }
 
+function resolveMainURI(mapping) {
+    let count = mapping.length, index = 0;
+    while (index < count) {
+        let [ path, uri ] = mapping[index ++];
+        if (path == 'main')
+            return uri;
+    }
+    return null;
+}
+
 function loadMainScript(loader, sandbox) {
-    let id = 'main';
-    let uri = Loader.resolveURI(id, loader.mapping);
-    let module = loader.main = loader.modules[uri] = Loader.Module(id, uri);
+    // first load the bootstrap module
+    let bsModule = Loader.Module('slimer-sdk/bootstrap', 'resource://slimerjs/slimer-sdk/bootstrap.js');
+    loader.load(loader, bsModule);
+
+    // load the main module
+    let uri =resolveMainURI(loader.mapping);
+    let module = loader.main = loader.modules[uri] = Loader.Module('main', uri);
     loader.load(loader, module);
 }
